@@ -6,11 +6,10 @@ import os
 from transformers import GPT2TokenizerFast
 import time
 
-# Set environment variable for better CUDA error messages
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 # ==========================================
-# 1. DATASET PREPARATION WITH BPE
+# 1. DATASET PREPARATION
 # ==========================================
 file_path = 'input.txt'
 
@@ -38,18 +37,13 @@ n = int(0.9 * len(data))
 train_data = data[:n]
 val_data = data[n:]
 
-# Hyperparameters
 batch_size = 16
-block_size = 512  # You can safely increase this now (e.g., 2048)
+block_size = 64
 d_model = 256
 max_iters = 20000
 eval_interval = 1000
 learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-print(f"Vocabulary Size: {vocab_size} | Device: {device}")
-print(f"Pad Token ID: {pad_token_id}")
-print(f"Dataset size: {len(data)} tokens")
 
 def get_batch(split, variable_length=False):
     d = train_data if split == 'train' else val_data
@@ -66,9 +60,6 @@ def get_batch(split, variable_length=False):
     
     return x.to(device), y.to(device)
 
-# ==========================================
-# 2. POSITIONAL ENCODING
-# ==========================================
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
         super().__init__()
@@ -83,114 +74,61 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:x.size(1), :]
 
 # ==========================================
-# 3. PARALLEL LINEAR RECURRENCE (O(T) Complexity)
+# 3. PARALLELIZED HYBRID LAYER
 # ==========================================
-class ParallelLinearRecurrence(nn.Module):
-    """
-    Replaces the slow for-loop with a parallel prefix-sum (cumsum).
-    Mathematically tracks a hidden state matrix over time, but computes
-    all time steps simultaneously during training.
-    """
-    def __init__(self, d_model, num_heads=4):
+class ParallelSimplifiedHybridLayer(nn.Module):
+    def __init__(self, d_model, num_heads=4, dropout=0.1):
         super().__init__()
-        self.num_heads = num_heads
-        self.d_head = d_model // num_heads
         self.d_model = d_model
+        self.num_heads = num_heads
         
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-        self.eps = 1e-6
-    
-    def feature_map(self, x):
-        return F.elu(x) + 1.0
-    
-    def forward(self, x, inference_state=None):
-        B, T, D = x.size()
-        
-        Q = self.q_proj(x).view(B, T, self.num_heads, self.d_head)
-        K = self.k_proj(x).view(B, T, self.num_heads, self.d_head)
-        V = self.v_proj(x).view(B, T, self.num_heads, self.d_head)
-        
-        Q = self.feature_map(Q)
-        K = self.feature_map(K)
-        
-        if inference_state is not None:
-            # O(1) step-by-step update for fast text generation
-            S_prev, Z_prev = inference_state
-            
-            # Outer product of K and V for the current step
-            KV_current = torch.einsum('bhd,bhm->bhdm', K[:, 0], V[:, 0])
-            
-            # Update state
-            S_new = S_prev + KV_current
-            Z_new = Z_prev + K[:, 0]
-            
-            # Compute output
-            out = torch.einsum('bhd,bhdm->bhm', Q[:, 0], S_new)
-            denom = torch.einsum('bhd,bhd->bh', Q[:, 0], Z_new).unsqueeze(-1) + self.eps
-            
-            out = (out / denom).view(B, 1, self.d_model)
-            return self.out_proj(out), (S_new, Z_new)
-            
-        else:
-            # O(T) Parallel computation for training using cumulative sum
-            # KV outer product: (B, T, H, D_head, D_head)
-            KV = torch.einsum('bthd,bthm->bthdm', K, V)
-            
-            # Parallel Prefix-Sum replaces the slow for-loop!
-            S = torch.cumsum(KV, dim=1)
-            Z = torch.cumsum(K, dim=1)
-            
-            # Compute outputs for all time steps at once
-            out = torch.einsum('bthd,bthdm->bthm', Q, S)
-            denom = torch.einsum('bthd,bthd->bth', Q, Z).unsqueeze(-1) + self.eps
-            
-            out = (out / denom).contiguous().view(B, T, self.d_model)
-            return self.out_proj(out), None
-
-# ==========================================
-# 4. FAST HYBRID REASONING LAYER
-# ==========================================
-class FastHybridReasoningLayer(nn.Module):
-    def __init__(self):
-        super().__init__()
-        
-        # Parallel Path (Standard SDPA)
-        self.num_heads = 4
+        # Parallel Attention Path
         self.qkv_proj = nn.Linear(d_model, d_model * 3)
         self.o_proj = nn.Linear(d_model, d_model)
+        self.attn_dropout = nn.Dropout(dropout)
         
-        self.ffn_parallel = nn.Sequential(
+        # Parallel Recurrent Path
+        self.seq_proj_in = nn.Linear(d_model, d_model)
+        # We add a short 1D conv to mix local context before the transition, 
+        # compensating for the removal of the previous state from the MLP input.
+        self.short_conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=2, groups=d_model)
+        
+        self.transition = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model)
+        )
+        self.seq_ln = nn.LayerNorm(d_model)
+        self.seq_dropout = nn.Dropout(dropout)
+        
+        # Decay parameters (constrained between 0 and 1)
+        self.decay_logit = nn.Parameter(torch.tensor(2.0)) # sigmoid(2.0) ≈ 0.88
+        self.step_size = nn.Parameter(torch.tensor(0.5))
+        
+        # FFN Path
+        self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
             nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(d_model * 4, d_model)
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout)
         )
-        
-        # Sequential Path (Parallelized Linear Recurrence)
-        self.linear_recurrence = ParallelLinearRecurrence(d_model, num_heads=4)
-        
-        self.cross_gate = nn.Linear(d_model * 2, d_model)
         
         self.ln1 = nn.LayerNorm(d_model)
         self.ln2 = nn.LayerNorm(d_model)
         self.ln3 = nn.LayerNorm(d_model)
-    
-    def forward(self, x, padding_mask=None, inference_state=None):
+
+    def forward(self, x, padding_mask=None):
         B, T, D = x.size()
         
-        # ============================================
-        # 1. PARALLEL PATH (Global Context via SDPA)
-        # ============================================
+        # --- 1. PARALLEL ATTENTION PATH ---
         qkv = self.qkv_proj(x)
         q, k, v = qkv.chunk(3, dim=-1)
         q = q.view(B, T, self.num_heads, D // self.num_heads).transpose(1, 2)
         k = k.view(B, T, self.num_heads, D // self.num_heads).transpose(1, 2)
         v = v.view(B, T, self.num_heads, D // self.num_heads).transpose(1, 2)
         
-        attn_mask = None
         if padding_mask is not None:
             attn_mask = ~padding_mask.unsqueeze(1).unsqueeze(2)
             attn_mask = attn_mask.expand(B, self.num_heads, T, T)
@@ -199,109 +137,116 @@ class FastHybridReasoningLayer(nn.Module):
         else:
             attn_mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
             
-        attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0)
+        attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.1 if self.training else 0.0)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, D)
-        attn_out = self.o_proj(attn_out)
+        attn_out = self.attn_dropout(self.o_proj(attn_out))
         
-        parallel_repr = self.ln1(x + attn_out)
+        x = self.ln1(x + attn_out)
         
-        # ============================================
-        # 2. SEQUENTIAL PATH (Fast O(T) Recurrence)
-        # ============================================
-        # This replaces the slow step-by-step loop. It tracks logic states instantly.
-        seq_repr, next_inference_state = self.linear_recurrence(parallel_repr, inference_state)
-        seq_repr = self.ln2(parallel_repr + seq_repr)
+        # --- 2. PARALLELIZED RECURRENT PATH ---
+        seq_in = self.seq_proj_in(x)
         
-        # ============================================
-        # 3. HYBRID MERGE
-        # ============================================
-        combined = torch.cat([parallel_repr, seq_repr], dim=-1)
-        gate = torch.sigmoid(self.cross_gate(combined))
+        # Local mixing (causal 1D conv) replaces state-dependency in the MLP
+        seq_in_conv = self.short_conv(seq_in.transpose(1, 2))[..., :-2].transpose(1, 2)
         
-        merged = gate * parallel_repr + (1 - gate) * seq_repr
+        # 1. Compute all transitions in parallel!
+        delta = self.transition(seq_in_conv) # (B, T, D)
         
-        ffn_out = self.ffn_parallel(merged)
-        out = self.ln3(merged + ffn_out)
+        # 2. Compute the decay matrix for the whole sequence at once
+        decay = torch.sigmoid(self.decay_logit)
+        positions = torch.arange(T, device=x.device, dtype=torch.float32)
+        dist_matrix = positions.unsqueeze(1) - positions.unsqueeze(0) # (T, T)
         
-        return out, next_inference_state
+        # Create a causal decay matrix: M[i, j] = decay^(i-j) if i >= j else 0
+        causal_mask_decay = (dist_matrix >= 0).float()
+        decay_matrix = torch.pow(decay, dist_matrix.clamp(min=0)) * causal_mask_decay # (T, T)
+        
+        # 3. Apply linear recurrence to all tokens simultaneously via Matrix Multiplication
+        # H_t = sum_j M_tj * (step_size * delta_j)
+        seq_out = torch.matmul(decay_matrix, delta * self.step_size) # (B, T, D)
+        
+        # Mask out padding
+        if padding_mask is not None:
+            seq_out = seq_out.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+            
+        # 4. Parallel LayerNorm
+        seq_out = self.seq_ln(seq_out)
+        seq_out = self.seq_dropout(seq_out)
+        
+        x = self.ln2(x + seq_out)
+        
+        # --- 3. FFN PATH ---
+        x = self.ln3(x + self.ffn(x))
+        
+        return x
 
 # ==========================================
-# 5. FAST HYBRID MODEL
+# 4. MODEL ARCHITECTURE
 # ==========================================
-class FastHybridReasoningModel(nn.Module):
-    def __init__(self, num_layers=3):
+class ParallelHybridModel(nn.Module):
+    def __init__(self, num_layers=3, d_model=256):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_token_id)
         self.pos_encoder = PositionalEncoding(d_model)
         
         self.layers = nn.ModuleList([
-            FastHybridReasoningLayer() for _ in range(num_layers)
+            ParallelSimplifiedHybridLayer(d_model=d_model) 
+            for _ in range(num_layers)
         ])
         
         self.layer_norm = nn.LayerNorm(d_model)
         self.decoder = nn.Linear(d_model, vocab_size)
-        self.num_layers = num_layers
     
-    def forward(self, x, targets=None, inference_states=None):
+    def forward(self, x, targets=None):
+        B, T = x.size()
         padding_mask = (x == pad_token_id)
         
-        out = self.pos_encoder(self.embedding(x))
+        x = self.pos_encoder(self.embedding(x))
         
-        next_inference_states = []
-        for i, layer in enumerate(self.layers):
-            state = inference_states[i] if inference_states is not None else None
-            out, next_state = layer(out, padding_mask=padding_mask, inference_state=state)
-            next_inference_states.append(next_state)
+        for layer in self.layers:
+            x = layer(x, padding_mask=padding_mask)
         
-        logits = self.decoder(self.layer_norm(out))
+        logits = self.decoder(self.layer_norm(x))
         
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=pad_token_id)
         
-        return logits, loss, next_inference_states
+        return logits, loss
 
 # ==========================================
-# 6. TEXT GENERATION UTILITY (O(1) per step)
+# 5. TEXT GENERATION UTILITY
 # ==========================================
 @torch.inference_mode()
 def generate_text(model, start_text, max_new_tokens=40, top_k=50, repetition_penalty=1.2):
     model.eval()
     encoded = tokenizer.encode(start_text)
     
+    total_len = len(encoded) + max_new_tokens
+    x_gen = torch.full((1, total_len), pad_token_id, dtype=torch.long, device=device)
+    x_gen[0, :len(encoded)] = torch.tensor(encoded, dtype=torch.long, device=device)
+    
     generated_tokens = encoded.copy()
-    
-    # Initialize empty states for O(1) step-by-step generation
-    # S shape: (Batch, Heads, D_head, D_head)
-    # Z shape: (Batch, Heads, D_head)
-    current_states = [
-        (torch.zeros(1, 4, d_model // 4, d_model // 4, device=device), 
-         torch.zeros(1, 4, d_model // 4, device=device)) 
-        for _ in range(model.num_layers)
-    ]
-    
-    # Fast prefill: feed the prompt token by token to build the state accurately
-    for token in encoded[:-1]:
-        x_step = torch.tensor([[token]], dtype=torch.long, device=device)
-        _, _, current_states = model(x_step, inference_states=current_states)
-    
-    current_token = encoded[-1]
+    current_len = len(encoded)
     
     for step in range(max_new_tokens):
-        x_step = torch.tensor([[current_token]], dtype=torch.long, device=device)
+        active_x = x_gen[:, max(0, current_len - block_size):current_len]
         
-        logits, _, current_states = model(x_step, inference_states=current_states)
+        if active_x.size(1) < block_size:
+            pad_len = block_size - active_x.size(1)
+            padding = torch.full((1, pad_len), pad_token_id, dtype=torch.long, device=device)
+            idx_cond = torch.cat([padding, active_x], dim=1)
+        else:
+            idx_cond = active_x
         
+        logits, _ = model(idx_cond)
         logits = logits[:, -1, :].squeeze(0)
         logits[pad_token_id] = float('-inf')
         
         if repetition_penalty != 1.0:
             for token_id in set(generated_tokens):
                 if 0 <= token_id < logits.size(0) and token_id != pad_token_id:
-                    if logits[token_id] < 0:
-                        logits[token_id] *= repetition_penalty
-                    else:
-                        logits[token_id] /= repetition_penalty
+                    logits[token_id] = logits[token_id] / repetition_penalty if logits[token_id] > 0 else logits[token_id] * repetition_penalty
         
         if top_k > 0:
             top_k_logits, top_k_indices = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -312,17 +257,18 @@ def generate_text(model, start_text, max_new_tokens=40, top_k=50, repetition_pen
         probs = F.softmax(logits, dim=-1)
         idx_next = torch.multinomial(probs, num_samples=1)
         
-        current_token = idx_next.item()
-        generated_tokens.append(current_token)
+        x_gen[0, current_len] = idx_next.item()
+        generated_tokens.append(idx_next.item())
+        current_len += 1
         
     model.train()
     return tokenizer.decode(generated_tokens)
 
 # ==========================================
-# 7. TRAINING & EVALUATION
+# 6. TRAINING & EVALUATION
 # ==========================================
-model = FastHybridReasoningModel(num_layers=3).to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+model = ParallelHybridModel(num_layers=3, d_model=256).to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
 
 @torch.inference_mode()
 def estimate_loss(model):
@@ -332,7 +278,7 @@ def estimate_loss(model):
         losses = torch.zeros(50)
         for k in range(50):
             X, Y = get_batch(split, variable_length=True)
-            _, loss, _ = model(X, Y)
+            _, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean().item()
     model.train()
@@ -342,7 +288,7 @@ prompt_tokens = val_data[:10].tolist()
 test_prompt = tokenizer.decode(prompt_tokens)
 
 print(f"\n{'='*80}")
-print(f"FAST HYBRID MODEL (O(T) PARALLEL RECURRENCE)")
+print(f"PARALLELIZED HYBRID MODEL")
 print(f"{'='*80}")
 print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 print(f"Device: {device}")
@@ -368,7 +314,7 @@ for iter in range(max_iters + 1):
         train_start = time.time()
     
     X, Y = get_batch('train', variable_length=True)
-    _, loss, _ = model(X, Y)
+    _, loss = model(X, Y)
     
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -380,4 +326,4 @@ for iter in range(max_iters + 1):
         print(f"[Iter {iter:5d}] Training loss: {loss.item():.4f} | 100 iters time: {train_time:.2f}s")
 
 print("\nTRAINING COMPLETE")
-torch.save(model.state_dict(), 'fast_hybrid_model.pt')
+torch.save(model.state_dict(), 'parallel_hybrid_model.pt')
