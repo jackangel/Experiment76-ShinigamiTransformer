@@ -38,7 +38,7 @@ n = int(0.9 * len(data))
 train_data = data[:n]
 val_data = data[n:]
 
-batch_size = 16
+batch_size = 8
 block_size = 32            # Starting block size
 max_block_size = 1024      # Maximum block size before stopping training entirely
 d_model = 256
@@ -72,26 +72,39 @@ def get_batch(split, variable_length=False):
     return x.to(device), y.to(device)
 
 # ==========================================
-# 2. POSITIONAL ENCODING
+# 2. ROTARY POSITIONAL ENCODING (RoPE)
 # ==========================================
-class PositionalEncoding(nn.Module):
+def apply_rotary_emb(x, freqs_cis):
+    # x shape: (B, T, D)
+    # freqs_cis shape: (T, D/2)
+    B, T, D = x.shape
+    x_reshaped = x.view(B, T, D // 2, 2)
+    x_complex = torch.view_as_complex(x_reshaped)
+    
+    freqs_cis = freqs_cis[:T].unsqueeze(0) # (1, T, D/2)
+    x_rotated = x_complex * freqs_cis
+    
+    x_out = torch.view_as_real(x_rotated).view(B, T, D)
+    return x_out
+
+class RotaryPositionalEmbedding(nn.Module):
     def __init__(self, d_model, max_len=8192):
         super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
+        self.d_model = d_model
+        # Precompute frequencies
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, d_model, 2).float() / d_model))
+        t = torch.arange(max_len).type_as(inv_freq)
+        freqs = torch.outer(t, inv_freq)
+        self.register_buffer('freqs_cis', torch.polar(torch.ones_like(freqs), freqs))
 
     def forward(self, x):
-        return x + self.pe[:x.size(1), :]
+        return apply_rotary_emb(x, self.freqs_cis)
 
 # ==========================================
 # 3. PARALLELIZED HYBRID REASONING LAYER (3-TIER)
 # ==========================================
 class ParallelHybridReasoningLayer(nn.Module):
-    def __init__(self, d_model, window_size=8, summary_decay=0.9, num_global_tokens=4):
+    def __init__(self, d_model, window_size=8, summary_decay=0.9, num_global_tokens=4, dropout_rate=0.1):
         super().__init__()
         self.d_model = d_model
         self.window_size = window_size
@@ -124,7 +137,7 @@ class ParallelHybridReasoningLayer(nn.Module):
         self.ffn_parallel = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(dropout_rate),
             nn.Linear(d_model * 4, d_model)
         )
         
@@ -132,7 +145,7 @@ class ParallelHybridReasoningLayer(nn.Module):
         self.transition = nn.Sequential(
             nn.Linear(d_model * 2, d_model * 2), 
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(dropout_rate),
             nn.Linear(d_model * 2, d_model)
         )
         
@@ -244,22 +257,28 @@ class ParallelHybridReasoningModel(nn.Module):
     def __init__(self, num_layers=3, window_size=8, summary_decay=0.9):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_token_id)
-        self.pos_encoder = PositionalEncoding(d_model)
+        self.pos_encoder = RotaryPositionalEmbedding(d_model) # Switched to RoPE
         
         self.layers = nn.ModuleList([
-            ParallelHybridReasoningLayer(d_model, window_size=window_size, summary_decay=summary_decay) 
+            ParallelHybridReasoningLayer(d_model, window_size=window_size, summary_decay=summary_decay, dropout_rate=0.1) 
             for _ in range(num_layers)
         ])
         
         self.layer_norm = nn.LayerNorm(d_model)
         self.decoder = nn.Linear(d_model, vocab_size)
     
+    def update_dropout(self, new_dropout_rate):
+        """Dynamically update dropout rates across the model"""
+        for module in self.modules():
+            if isinstance(module, nn.Dropout):
+                module.p = new_dropout_rate
+                
     def forward(self, x, targets=None, sequential_state=None, trajectory_summary=None):
         B, T = x.size()
         padding_mask = (x == pad_token_id)
         
         parallel_repr = self.embedding(x)
-        parallel_repr = self.pos_encoder(parallel_repr)
+        parallel_repr = self.pos_encoder(parallel_repr) # Applying RoPE
         
         if sequential_state is None:
             sequential_state = torch.zeros(B, d_model, device=x.device)
@@ -346,6 +365,10 @@ model = ParallelHybridReasoningModel(num_layers=3, window_size=8, summary_decay=
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 scaler = torch.amp.GradScaler(device) if device == 'cuda' else None
 
+# Added Cosine Annealing LR Scheduler
+max_iters_estimate = 20000 # Adjust based on your expected total training steps
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_iters_estimate, eta_min=1e-5)
+
 @torch.no_grad()
 def estimate_loss(model):
     out = {}
@@ -386,7 +409,8 @@ while block_size <= max_block_size:
         eval_time = time.time() - start_time
         val_loss = losses['val']
         
-        print(f"\n[Iter {iter_num:5d} | BS: {block_size}] Loss: Train {losses['train']:.4f}, Val {val_loss:.4f} | Eval time: {eval_time:.2f}s")
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"\n[Iter {iter_num:5d} | BS: {block_size}] Loss: Train {losses['train']:.4f}, Val {val_loss:.4f} | LR: {current_lr:.6f} | Eval time: {eval_time:.2f}s")
         
         # Curriculum Learning Logic
         if val_loss < best_val_loss - min_delta:
@@ -403,6 +427,11 @@ while block_size <= max_block_size:
             block_size *= 2
             patience_counter = 0
             best_val_loss = float('inf') # Reset best loss for the new block size context
+            
+            # Dynamic Dropout Update: Increase dropout as block size grows
+            new_dropout = min(0.3, 0.1 + 0.05 * math.log2(block_size / 32))
+            model.update_dropout(new_dropout)
+            print(f"-> Updated Dropout Rate to: {new_dropout:.2f}")
             
             if block_size > max_block_size:
                 print(f"Reached maximum block size ({max_block_size}). Ending training.")
@@ -440,6 +469,9 @@ while block_size <= max_block_size:
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        
+    # Step the learning rate scheduler
+    scheduler.step()
     
     if iter_num % 100 == 0 and iter_num > 0:
         train_time = time.time() - train_start
