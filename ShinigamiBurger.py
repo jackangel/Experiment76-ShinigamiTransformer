@@ -333,6 +333,7 @@ class TwoTierFusionModel(nn.Module):
 model = TwoTierFusionModel(local_layers=num_layers, global_layers=2).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
 scaler = torch.amp.GradScaler(device) if device == 'cuda' else None
+checkpoint_path = 'two_tier_fusion_model.pt'
 
 @torch.no_grad()
 def estimate_loss(model):
@@ -351,6 +352,38 @@ def estimate_loss(model):
         out[split] = losses.mean().item()
     model.train()
     return out
+
+@torch.no_grad()
+def generate_prediction(model, prompt="Move Up", max_new_tokens=20):
+    model.eval()
+    tokens = tokenizer.encode(prompt)
+    x = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
+    for _ in range(max_new_tokens):
+        logits, _ = model(x)
+        next_token_logits = logits[:, -1, :]
+        next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
+        x = torch.cat((x, next_token), dim=1)
+    model.train()
+    return tokenizer.decode(x[0].tolist())
+
+# Check for existing checkpoint
+if os.path.exists(checkpoint_path):
+    user_choice = input(f"Checkpoint '{checkpoint_path}' found. Enter 'c' to continue training, or 'chat' to enter chat mode: ").strip().lower()
+    if user_choice == 'chat':
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        print("\n--- Entering Chat Mode ---")
+        print("Type 'quit' or 'exit' to stop.")
+        while True:
+            user_input = input("You: ")
+            if user_input.lower() in ['quit', 'exit']:
+                exit()
+            response = generate_prediction(model, prompt=user_input, max_new_tokens=30)
+            print(f"Model: {response}\n")
+    elif user_choice == 'c':
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        print("Checkpoint loaded. Resuming training...")
+    else:
+        print("Invalid choice. Starting training from scratch...")
 
 print(f"\n{'='*80}")
 print(f"TWO-TIER FUSION MODEL (Local + Global + Attn CNN)")
@@ -378,6 +411,13 @@ for iter_num in range(max_iters + 1):
             f"Eval: {eval_time:.2f}s | Total: {total_time:.2f}s"
         )
 
+    # Every 1000 iterations, print a prediction
+    if iter_num % 1000 == 0 and iter_num > 0:
+        sample_pred = generate_prediction(model, prompt="Move Up, Move Left ->")
+        print(f"--- Prediction Sample @ Iter {iter_num} ---")
+        print(f"{sample_pred}")
+        print("-------------------------------------------")
+
     X, Y = get_batch('train', variable_length=True)
     optimizer.zero_grad(set_to_none=True)
 
@@ -403,4 +443,5 @@ for iter_num in range(max_iters + 1):
         optimizer.step()
 
 print("\nTRAINING COMPLETE")
-torch.save(model.state_dict(), 'two_tier_fusion_model.pt')
+torch.save(model.state_dict(), checkpoint_path)
+print(f"Model saved to {checkpoint_path}")
